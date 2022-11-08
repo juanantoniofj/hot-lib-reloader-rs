@@ -1,14 +1,15 @@
 use libloading::Library;
 use libloading::Symbol;
-use notify::watcher;
-use notify::DebouncedEvent;
+use notify_debouncer_mini::new_debouncer;
 use notify::RecursiveMode;
-use notify::Watcher;
+use notify_debouncer_mini::{notify::*};
+use std::any::Any;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU32;
 use std::sync::atomic::Ordering;
+use std::result::Result;
 use std::sync::Mutex;
 use std::sync::{mpsc, Arc};
 use std::thread;
@@ -192,10 +193,9 @@ impl LibReloader {
         // a pending change still waiting to be loaded, set `self.changed` to true. This
         // then gets picked up by `self.update`.
         thread::spawn(move || {
-            use DebouncedEvent::*;
-
             let (tx, rx) = mpsc::channel();
-            let mut watcher = watcher(tx, debounce).unwrap();
+            let mut debouncer = new_debouncer(debounce, None, tx).unwrap();
+            let watcher = debouncer.watcher();
             watcher
                 .watch(&lib_file, RecursiveMode::NonRecursive)
                 .expect("watch lib file");
@@ -227,31 +227,36 @@ impl LibReloader {
 
             loop {
                 match rx.recv() {
-                    Ok(Chmod(_) | Create(_) | Write(_)) => {
-                        signal_change();
-                    }
-                    Ok(Remove(_)) => {
-                        // just one hard link removed?
-                        if !lib_file.exists() {
-                            log::debug!(
-                                "{} was removed, trying to watch it again...",
-                                lib_file.display()
-                            );
+                    Ok(events) => {
+                        match events {
+                            Ok(e) => { e.iter().for_each(|e| {
+                                log::trace!("file change event: {e:?}");
+                                if e.kind.type_id() == EventKind::Remove.type_id() {
+                                    if !lib_file.exists() {
+                                        log::debug!(
+                                            "{} was removed, trying to watch it again...",
+                                            lib_file.display()
+                                        );
+                                    }
+                                    loop {
+                                        if watcher
+                                            .watch(&lib_file, RecursiveMode::NonRecursive)
+                                            .is_ok()
+                                        {
+                                            log::info!("watching {lib_file:?} again after removal");
+                                            signal_change();
+                                            break;
+                                        }
+                                        thread::sleep(Duration::from_millis(500));
+                                    }
+                                } else {
+                                    signal_change();
+                                }
+                            })},
+                            Err(err) => { err.iter().for_each(|e| {
+                                log::error!("file watcher error, stopping reload loop: {e}");
+                            })},
                         }
-                        loop {
-                            if watcher
-                                .watch(&lib_file, RecursiveMode::NonRecursive)
-                                .is_ok()
-                            {
-                                log::info!("watching {lib_file:?} again after removal");
-                                signal_change();
-                                break;
-                            }
-                            thread::sleep(Duration::from_millis(500));
-                        }
-                    }
-                    Ok(change) => {
-                        log::trace!("file change event: {change:?}");
                     }
                     Err(err) => {
                         log::error!("file watcher error, stopping reload loop: {err}");
